@@ -1,33 +1,42 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
-
 using AForge.Video;
 using AForge.Video.DirectShow;
 
 namespace tCamView
 {
-
     public partial class Form1 : Form
     {
-        // 타원형 윈도우를 만들기 위함.
-        // https://stackoverflow.com/questions/5092216/c-sharp-form-with-custom-border-and-rounded-edges
+        // For ellipse/rounded window shapes
         [DllImport("Gdi32.dll", EntryPoint = "CreateRoundRectRgn")]
         private static extern IntPtr CreateRoundRectRgn
         (
-            int nLeftRect,     // x-coordinate of upper-left corner
-            int nTopRect,      // y-coordinate of upper-left corner
-            int nRightRect,    // x-coordinate of lower-right corner
-            int nBottomRect,   // y-coordinate of lower-right corner
-            int nWidthEllipse, // height of ellipse
-            int nHeightEllipse // width of ellipse
+            int nLeftRect,
+            int nTopRect,
+            int nRightRect,
+            int nBottomRect,
+            int nWidthEllipse,
+            int nHeightEllipse
         );
+
+        // For WM_SIZING aspect-ratio enforcement
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        private const int WM_SIZING = 0x0214;
+        private const int WMSZ_LEFT = 1, WMSZ_RIGHT = 2, WMSZ_TOP = 3,
+                          WMSZ_TOPLEFT = 4, WMSZ_TOPRIGHT = 5,
+                          WMSZ_BOTTOM = 6, WMSZ_BOTTOMLEFT = 7, WMSZ_BOTTOMRIGHT = 8;
 
         private FilterInfoCollection webcam;
         private VideoCaptureDevice cam;
+
         List<string> videoCaptureDevicesList = new List<string>();
         List<string> videoCapabilitiesList = new List<string>();
 
@@ -37,155 +46,285 @@ namespace tCamView
         int currSizeID = -1;
         int cropSize = 0;
 
-        //private object lockObject = new object();
-
         MenuItem Menu_VideoCaptureDevices = new MenuItem("Video Capture Devices");
         MenuItem Menu_VideoCapabilities = new MenuItem("Video Resolutions");
 
         bool firstimage_captured = false;
-
         int videoCaptureDevicesListCount = 0;
         int videoCapabilitiesListCount = 0;
         int currMenuItem0VideoCaptureDevices = -1;
         int currMenuItem1VideoCapabilities = -1;
-        
         int currMenuItem3WindowStyles = 0;
         const int currMenuItem3WindowStylesCount = 5;
 
-        bool stretchKeepAspectRatio = true;  // Alt.Stretch, UniformToFill
+        bool stretchKeepAspectRatio = true; // Alt.Stretch / UniformToFill
+
+        // --- NEW: Lock Aspect Ratio ---
+        bool lockAspectRatio = false;
+        double lockedAspect = 0.0; // height / width
+
+        // --- Settings file path ---
+        private static readonly string SettingsPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "tCamView", "settings.ini");
 
         public Form1()
         {
             InitializeComponent();
-
             FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
             this.ControlBox = true;
             this.Icon = Properties.Resources.webcam;
             this.Opacity = 1.0;
-
+            this.ShowInTaskbar = true;
             pictureBox1.SizeMode = PictureBoxSizeMode.StretchImage;
             stretchKeepAspectRatio = true;
             this.Text = "tCamView (alt.stretch)";
-
-            // DPI aware 
-            // https://help.syncfusion.com/windowsforms/highdpi-support
-            // https://stackoverrun.com/ko/q/8936019
-            // see app.manifest
         }
 
+        // -------------------------------------------------------
+        //  SETTINGS  SAVE / LOAD
+        // -------------------------------------------------------
+        private void SaveSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
+                var sb = new StringBuilder();
+                sb.AppendLine("CamID=" + currCamID);
+                sb.AppendLine("SizeID=" + currSizeID);
+                sb.AppendLine("PictureSizeMode=" + (int)pictureBox1.SizeMode);
+                sb.AppendLine("StretchKeepAspectRatio=" + stretchKeepAspectRatio);
+                sb.AppendLine("WindowStyle=" + currMenuItem3WindowStyles);
+                sb.AppendLine("FlipH=" + state_flip_horizontal);
+                sb.AppendLine("FlipV=" + state_flip_vertical);
+                sb.AppendLine("Opacity=" + this.Opacity.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                sb.AppendLine("AlwaysOnTop=" + this.TopMost);
+                sb.AppendLine("LockAspectRatio=" + lockAspectRatio);
+                sb.AppendLine("CropSize=" + cropSize);
+                // Save window size and position for all styles except maximized full screen
+                if (this.WindowState != FormWindowState.Maximized)
+                {
+                    sb.AppendLine("WinX=" + this.Left);
+                    sb.AppendLine("WinY=" + this.Top);
+                    sb.AppendLine("WinW=" + this.Width);
+                    sb.AppendLine("WinH=" + this.Height);
+                }
+                File.WriteAllText(SettingsPath, sb.ToString());
+            }
+            catch { /* silently ignore save errors */ }
+        }
+
+        private Dictionary<string, string> LoadSettings()
+        {
+            var dict = new Dictionary<string, string>();
+            try
+            {
+                if (!File.Exists(SettingsPath)) return dict;
+                foreach (var line in File.ReadAllLines(SettingsPath))
+                {
+                    var idx = line.IndexOf('=');
+                    if (idx > 0)
+                        dict[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
+                }
+            }
+            catch { }
+            return dict;
+        }
+
+        private T GetSetting<T>(Dictionary<string, string> d, string key, T defaultVal)
+        {
+            if (!d.ContainsKey(key)) return defaultVal;
+            try { return (T)Convert.ChangeType(d[key], typeof(T), System.Globalization.CultureInfo.InvariantCulture); }
+            catch { return defaultVal; }
+        }
+
+        // -------------------------------------------------------
+        //  FORM LOAD
+        // -------------------------------------------------------
         private void Form1_Load(object sender, EventArgs e)
         {
+            var settings = LoadSettings();
+
             try
             {
                 webcam = new FilterInfoCollection(FilterCategory.VideoInputDevice);
                 foreach (FilterInfo VideoCaptureDevice in webcam)
-                {
                     videoCaptureDevicesList.Add(VideoCaptureDevice.Name);
-                }
             }
-            catch (Exception error)
-            {
-                MessageBox.Show(error.Message);
-            }
+            catch (Exception error) { MessageBox.Show(error.Message); }
+
             Focus();
 
-            for (var i = 0; i < videoCaptureDevicesList.Count; i++) 
+            for (var i = 0; i < videoCaptureDevicesList.Count; i++)
             {
                 MenuItem mi = new MenuItem(videoCaptureDevicesList[i]);
                 mi.Click += new EventHandler(MenuItem_VideoCaptureDevices_Click);
                 mi.Tag = new object[] { i };
                 Menu_VideoCaptureDevices.MenuItems.Add(mi);
             }
-
             videoCaptureDevicesListCount = videoCaptureDevicesList.Count;
-            for (int i = 0; i < videoCaptureDevicesList.Count; i++)
+
+            // Restore saved camera / size, or pick defaults
+            int savedCam = GetSetting(settings, "CamID", -1);
+            int savedSize = GetSetting(settings, "SizeID", -1);
+
+            bool opened = false;
+            if (savedCam >= 0 && savedCam < videoCaptureDevicesListCount)
             {
-                if (openVideoCaptureDevice(i, -1) == 1)  // -1: Choose the maximum resolution 
+                if (openVideoCaptureDevice(savedCam, savedSize) == 1)
                 {
-                    currMenuItem0VideoCaptureDevices = i;
-                    currMenuItem1VideoCapabilities = 0;
-                    break;
+                    currMenuItem0VideoCaptureDevices = savedCam;
+                    currMenuItem1VideoCapabilities = currSizeID;
+                    opened = true;
+                }
+            }
+            if (!opened)
+            {
+                for (int i = 0; i < videoCaptureDevicesList.Count; i++)
+                {
+                    if (openVideoCaptureDevice(i, -1) == 1)
+                    {
+                        currMenuItem0VideoCaptureDevices = i;
+                        currMenuItem1VideoCapabilities = 0;
+                        break;
+                    }
                 }
             }
 
             if (videoCaptureDevicesListCount == 0)
-            {  // Even if there is no video capture device,
-               // the context menu must be created to eliminate the runtime error.
                 CreateContextMenu();
+
+            // Restore picture mode
+            int savedMode = GetSetting(settings, "PictureSizeMode", (int)PictureBoxSizeMode.StretchImage);
+            bool savedStretch = GetSetting(settings, "StretchKeepAspectRatio", true);
+            stretchKeepAspectRatio = savedStretch;
+            pictureBox1.SizeMode = (PictureBoxSizeMode)savedMode;
+            switch (pictureBox1.SizeMode)
+            {
+                case PictureBoxSizeMode.Zoom: this.Text = "tCamView (zoom)"; break;
+                case PictureBoxSizeMode.CenterImage: this.Text = "tCamView (center)"; break;
+                case PictureBoxSizeMode.StretchImage:
+                    this.Text = stretchKeepAspectRatio ? "tCamView (alt.stretch)" : "tCamView (stretch)"; break;
             }
 
-            // Update the Checked mark...
+            // Restore flips
+            state_flip_horizontal = GetSetting(settings, "FlipH", false);
+            state_flip_vertical = GetSetting(settings, "FlipV", false);
+
+            // Restore opacity
+            this.Opacity = GetSetting(settings, "Opacity", 1.0);
+
+            // Restore always on top
+            this.TopMost = GetSetting(settings, "AlwaysOnTop", true);
+
+            // Restore lock aspect ratio
+            lockAspectRatio = GetSetting(settings, "LockAspectRatio", false);
+
+            // Restore crop size
+            cropSize = GetSetting(settings, "CropSize", 0);
+
+            // Apply window style first so border mode is correct before sizing
+            int savedWinStyle = GetSetting(settings, "WindowStyle", 0);
+            ApplyWindowStyle(savedWinStyle);
+
+            // Restore size/position AFTER style is set so the region is built
+            // with the correct dimensions (critical for borderless modes)
+            int wx = GetSetting(settings, "WinX", -1);
+            int wy = GetSetting(settings, "WinY", -1);
+            int ww = GetSetting(settings, "WinW", -1);
+            int wh = GetSetting(settings, "WinH", -1);
+            if (wx >= 0 && wy >= 0 && ww > 50 && wh > 50 && savedWinStyle != 4 /* not fullscreen */)
+            {
+                this.StartPosition = FormStartPosition.Manual;
+                this.Left = wx; this.Top = wy;
+                this.Width = ww; this.Height = wh;
+                // For borderless styles, rebuild the region now that size is final
+                RefreshRegion();
+            }
+
+            // Update aspect ratio lock state
+            if (lockAspectRatio)
+                lockedAspect = (double)this.Height / this.Width;
+
             UpdateMenuItemsChecked();
-
-            // Always on Top
-            this.TopMost = true;
         }
 
-        private int openVideoCaptureDevice(int deviceID, int sizeID)
+        private void ApplyWindowStyle(int styleIndex)
         {
-            List<int> numOfPixelsList = new List<int>();
-
-            if (cam != null)
+            currMenuItem3WindowStyles = styleIndex;
+            switch (styleIndex)
             {
-                closeVideoCaptureDevice();
+                case 0: // Normal
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
+                    if (this.WindowState != FormWindowState.Normal)
+                        WindowState = FormWindowState.Normal;
+                    break;
+                case 1: // Borderless Ellipse
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+                    Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, Width, Height));
+                    break;
+                case 2: // Borderless Rectangle
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+                    Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 0, 0));
+                    break;
+                case 3: // Borderless Rounded Rectangle
+                    int m = Math.Min(Width, Height) / 4;
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+                    Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, m, m));
+                    break;
+                case 4: // Full Screen
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
+                    WindowState = FormWindowState.Normal;
+                    FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+                    WindowState = FormWindowState.Maximized;
+                    break;
             }
-            cropSize = 0;
-
-            cam = new VideoCaptureDevice(webcam[deviceID].MonikerString);
-            cam.NewFrame += new NewFrameEventHandler(cam_NewFrame);
-            //cam.DisplayPropertyPage(new IntPtr(0));
-
-            var videoCapabilities = cam.VideoCapabilities;
-            videoCapabilitiesList.Clear();
-            numOfPixelsList.Clear();
-            foreach (var video in videoCapabilities)
-            {
-                videoCapabilitiesList.Add(video.FrameSize.Width + "x" + video.FrameSize.Height);
-                numOfPixelsList.Add(video.FrameSize.Width * video.FrameSize.Height);
-            }
-
-            int max, indexMax = 0;
-            if (numOfPixelsList.Count() > 0)
-            {
-                max = numOfPixelsList.Max();
-                indexMax = Array.IndexOf(numOfPixelsList.ToArray(), max);
-            }
-
-            currCamID = deviceID;
-            currSizeID = (sizeID < 0) ? indexMax : sizeID;
-            if (videoCapabilities.Count() > 0)
-                cam.VideoResolution = cam.VideoCapabilities[currSizeID];
-
-            videoCapabilitiesListCount = videoCapabilities.Count();
-
-            //cam.SetCameraProperty(AForge.Video.DirectShow.CameraControlProperty.Exposure, -2, AForge.Video.DirectShow.CameraControlFlags.Manual);
-            //cam.SetCameraProperty(AForge.Video.DirectShow.CameraControlProperty.Focus, 0, AForge.Video.DirectShow.CameraControlFlags.Manual);
-            //cam.SetCameraProperty(AForge.Video.DirectShow.CameraControlProperty.Zoom, 100, AForge.Video.DirectShow.CameraControlFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.BacklightCompensation, 0, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.Contrast, 128, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.Gain, 160, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.WhiteBalance, 5920, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.Sharpness, 128, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-            //videoSource.SetVideoProperty(AForge.Video.DirectShow.VideoProcAmpProperty.Saturation, 128, AForge.Video.DirectShow.VideoProcAmpFlags.Manual);
-
-            firstimage_captured = false;
-            cam.Start();
-
-            CreateContextMenu();
-
-            // 카메라가 다른 프로그램에 의해 사용중인지 체크하기 위한 트릭
-            for (int i = 0; i < 10; i++)
-            {
-                if (firstimage_captured == true)
-                    return 1;
-                System.Threading.Thread.Sleep(100);
-            }
-            return 0;
+            // Windows can silently clear ShowInTaskbar when FormBorderStyle changes,
+            // so explicitly re-assert it after every style switch.
+            this.ShowInTaskbar = true;
         }
 
+        // -------------------------------------------------------
+        //  WM_SIZING  – enforce locked aspect ratio while resizing
+        // -------------------------------------------------------
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_SIZING && lockAspectRatio && lockedAspect > 0)
+            {
+                var rc = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                int w = rc.Right - rc.Left;
+                int h = rc.Bottom - rc.Top;
+
+                switch (m.WParam.ToInt32())
+                {
+                    case WMSZ_LEFT:
+                    case WMSZ_RIGHT:
+                    case WMSZ_BOTTOMLEFT:
+                    case WMSZ_BOTTOMRIGHT:
+                        rc.Bottom = rc.Top + (int)(w * lockedAspect);
+                        break;
+                    case WMSZ_TOP:
+                    case WMSZ_BOTTOM:
+                    case WMSZ_TOPLEFT:
+                    case WMSZ_TOPRIGHT:
+                        rc.Right = rc.Left + (int)(h / lockedAspect);
+                        break;
+                }
+
+                Marshal.StructureToPtr(rc, m.LParam, false);
+                m.Result = (IntPtr)1;
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // -------------------------------------------------------
+        //  CONTEXT MENU
+        // -------------------------------------------------------
         private void CreateContextMenu()
         {
             ContextMenu cm = new ContextMenu();
+
             Menu_VideoCapabilities.MenuItems.Clear();
             for (var i = 0; i < videoCapabilitiesList.Count; i++)
             {
@@ -200,15 +339,18 @@ namespace tCamView
             pictureMode.MenuItems.Add(new MenuItem("Stretch [X]", MenuItem_Stretch_Click));
             pictureMode.MenuItems.Add(new MenuItem("Center [C]", MenuItem_Center_Click));
             pictureMode.MenuItems.Add(new MenuItem("Alt.Stretch [A]", MenuItem_AltStretch_Click));
+
             MenuItem borderOptions = new MenuItem("Window Styles");
             borderOptions.MenuItems.Add(new MenuItem("Normal Border (Resizable) [N or Esc]", MenuItem_Normal_Border_Click));
             borderOptions.MenuItems.Add(new MenuItem("Borderless Ellipse (FixedSize) [E]", MenuItem_Borderless_Ellipse_Click));
             borderOptions.MenuItems.Add(new MenuItem("Borderless Rectangle (FixedSize) [R]", MenuItem_Borderless_Rectangle_Click));
             borderOptions.MenuItems.Add(new MenuItem("Borderless Rounded Rectangle (FixedSize) [W]", MenuItem_Borderless_RoundedRectangle_Click));
             borderOptions.MenuItems.Add(new MenuItem("Full Screen [F]", MenuItem_FullScreen_Click));
+
             MenuItem imageFlipping = new MenuItem("Image Flipping");
             imageFlipping.MenuItems.Add(new MenuItem("Horizontal Flipping [H]", MenuItem_Horizontal_Flipping_Click));
             imageFlipping.MenuItems.Add(new MenuItem("Vertical Flipping [V]", MenuItem_Vertical_Flipping_Click));
+
             MenuItem opacityControl = new MenuItem("Opacity Control");
             opacityControl.MenuItems.Add(new MenuItem("Opacity Increase [Up Arrow]", MenuItem_Opacity_Increase_Click));
             opacityControl.MenuItems.Add(new MenuItem("Opacity Decrease [Down Arrow]", MenuItem_Opacity_Decrease_Click));
@@ -217,6 +359,7 @@ namespace tCamView
             opacityControl.MenuItems.Add(new MenuItem("Opacity 60%", MenuItem_Opacity_60_Click));
             opacityControl.MenuItems.Add(new MenuItem("Opacity 40%", MenuItem_Opacity_40_Click));
             opacityControl.MenuItems.Add(new MenuItem("Opacity 20% (min) [Left Arrow]", MenuItem_Opacity_20_Click));
+
             MenuItem addFeatures = new MenuItem("Additional Features");
             addFeatures.MenuItems.Add(new MenuItem("GetImage From Clipboard [G or ^V]", MenuItem_GetImageFromClipboard_Click));
             addFeatures.MenuItems.Add(new MenuItem("SetImage To Clipboard [I or ^C]", MenuItem_SetImageToClipboard_Click));
@@ -229,35 +372,50 @@ namespace tCamView
             addFeatures.MenuItems.Add("-");
             addFeatures.MenuItems.Add(new MenuItem("Increase the Window Size [P]", MenuItem_IncreaseWindowSize_Click));
             addFeatures.MenuItems.Add(new MenuItem("Decrease the Window Size [M]", MenuItem_DecreaseWindowSize_Click));
+
             MenuItem onTop = new MenuItem("Always on Top [T]", MenuItem_AlwaysOnTop_Click);
+
+            // NEW: Lock Aspect Ratio menu item
+            MenuItem lockAR = new MenuItem("Lock Aspect Ratio [K]", MenuItem_LockAspectRatio_Click);
+
             MenuItem minimizeApp = new MenuItem("Minimize [L]", MenuItem_Minimize_Click);
             MenuItem quitApp = new MenuItem("Quit [Q]", MenuItem_Quit_Click);
             MenuItem aboutApp = new MenuItem("About...", MenuItem_About_Click);
 
-            cm.MenuItems.AddRange(new MenuItem[] { Menu_VideoCaptureDevices, Menu_VideoCapabilities,
-                pictureMode, borderOptions, imageFlipping, opacityControl, addFeatures, onTop, minimizeApp, quitApp, aboutApp});
+            cm.MenuItems.AddRange(new MenuItem[] {
+                Menu_VideoCaptureDevices, Menu_VideoCapabilities,
+                pictureMode, borderOptions, imageFlipping, opacityControl, addFeatures,
+                onTop, lockAR, minimizeApp, quitApp, aboutApp
+            });
+
             pictureBox1.ContextMenu = cm;
         }
+
+        // Menu item indices (after adding Lock Aspect Ratio at index 8):
+        // 0 = VideoCaptureDevices
+        // 1 = VideoCapabilities
+        // 2 = PictureSize Mode
+        // 3 = Window Styles
+        // 4 = Image Flipping
+        // 5 = Opacity Control
+        // 6 = Additional Features
+        // 7 = Always on Top
+        // 8 = Lock Aspect Ratio   ← NEW
+        // 9 = Minimize
+        // 10 = Quit
+        // 11 = About
 
         private void UpdateMenuItemsChecked()
         {
             for (int i = 0; i < videoCaptureDevicesListCount; i++)
-            {
                 pictureBox1.ContextMenu.MenuItems[0].MenuItems[i].Checked = false;
-            }
             if (currMenuItem0VideoCaptureDevices >= 0 && currMenuItem0VideoCaptureDevices < videoCaptureDevicesListCount)
-            {
                 pictureBox1.ContextMenu.MenuItems[0].MenuItems[currMenuItem0VideoCaptureDevices].Checked = true;
-            }
 
             for (int i = 0; i < videoCapabilitiesListCount; i++)
-            {
                 pictureBox1.ContextMenu.MenuItems[1].MenuItems[i].Checked = false;
-            }
             if (currMenuItem1VideoCapabilities >= 0 && currMenuItem1VideoCapabilities < videoCapabilitiesListCount)
-            {
                 pictureBox1.ContextMenu.MenuItems[1].MenuItems[currMenuItem1VideoCapabilities].Checked = true;
-            }
 
             if (pictureBox1.SizeMode == PictureBoxSizeMode.Zoom)
             {
@@ -268,18 +426,16 @@ namespace tCamView
             }
             else if (pictureBox1.SizeMode == PictureBoxSizeMode.StretchImage)
             {
+                pictureBox1.ContextMenu.MenuItems[2].MenuItems[0].Checked = false;
+                pictureBox1.ContextMenu.MenuItems[2].MenuItems[2].Checked = false;
                 if (stretchKeepAspectRatio == false)
                 {
-                    pictureBox1.ContextMenu.MenuItems[2].MenuItems[0].Checked = false;
                     pictureBox1.ContextMenu.MenuItems[2].MenuItems[1].Checked = true;
-                    pictureBox1.ContextMenu.MenuItems[2].MenuItems[2].Checked = false;
                     pictureBox1.ContextMenu.MenuItems[2].MenuItems[3].Checked = false;
                 }
                 else
                 {
-                    pictureBox1.ContextMenu.MenuItems[2].MenuItems[0].Checked = false;
                     pictureBox1.ContextMenu.MenuItems[2].MenuItems[1].Checked = false;
-                    pictureBox1.ContextMenu.MenuItems[2].MenuItems[2].Checked = false;
                     pictureBox1.ContextMenu.MenuItems[2].MenuItems[3].Checked = true;
                 }
             }
@@ -292,82 +448,200 @@ namespace tCamView
             }
 
             for (int i = 0; i < currMenuItem3WindowStylesCount; i++)
-            {
                 pictureBox1.ContextMenu.MenuItems[3].MenuItems[i].Checked = false;
-            }
             pictureBox1.ContextMenu.MenuItems[3].MenuItems[currMenuItem3WindowStyles].Checked = true;
 
-            pictureBox1.ContextMenu.MenuItems[4].MenuItems[1].Checked = state_flip_vertical;
             pictureBox1.ContextMenu.MenuItems[4].MenuItems[0].Checked = state_flip_horizontal;
+            pictureBox1.ContextMenu.MenuItems[4].MenuItems[1].Checked = state_flip_vertical;
 
             pictureBox1.ContextMenu.MenuItems[7].Checked = this.TopMost;
+            pictureBox1.ContextMenu.MenuItems[8].Checked = lockAspectRatio; // Lock Aspect Ratio
         }
 
+        // -------------------------------------------------------
+        //  LOCK ASPECT RATIO
+        // -------------------------------------------------------
+        private void MenuItem_LockAspectRatio_Click(object sender, EventArgs e)
+        {
+            ToggleLockAspectRatio();
+        }
+
+        private void ToggleLockAspectRatio()
+        {
+            lockAspectRatio = !lockAspectRatio;
+            if (lockAspectRatio)
+                lockedAspect = (double)this.Height / this.Width;
+            UpdateMenuItemsChecked();
+        }
+
+        // -------------------------------------------------------
+        //  CAMERA
+        // -------------------------------------------------------
+        private int openVideoCaptureDevice(int deviceID, int sizeID)
+        {
+            List<int> numOfPixelsList = new List<int>();
+
+            if (cam != null)
+                closeVideoCaptureDevice();
+
+            cropSize = 0;
+            cam = new VideoCaptureDevice(webcam[deviceID].MonikerString);
+            cam.NewFrame += new NewFrameEventHandler(cam_NewFrame);
+
+            var videoCapabilities = cam.VideoCapabilities;
+            videoCapabilitiesList.Clear();
+            numOfPixelsList.Clear();
+
+            foreach (var video in videoCapabilities)
+            {
+                videoCapabilitiesList.Add(video.FrameSize.Width + "x" + video.FrameSize.Height);
+                numOfPixelsList.Add(video.FrameSize.Width * video.FrameSize.Height);
+            }
+
+            int indexMax = 0;
+            if (numOfPixelsList.Count() > 0)
+            {
+                int max = numOfPixelsList.Max();
+                indexMax = Array.IndexOf(numOfPixelsList.ToArray(), max);
+            }
+
+            currCamID = deviceID;
+            currSizeID = (sizeID < 0 || sizeID >= videoCapabilities.Count()) ? indexMax : sizeID;
+
+            if (videoCapabilities.Count() > 0)
+                cam.VideoResolution = cam.VideoCapabilities[currSizeID];
+
+            videoCapabilitiesListCount = videoCapabilities.Count();
+
+            firstimage_captured = false;
+            cam.Start();
+            CreateContextMenu();
+
+            for (int i = 0; i < 10; i++)
+            {
+                if (firstimage_captured == true) return 1;
+                System.Threading.Thread.Sleep(100);
+            }
+            return 0;
+        }
+
+        private void closeVideoCaptureDevice()
+        {
+            if (cam != null)
+            {
+                cam.SignalToStop();
+                for (int i = 0; i < 30; i++)
+                {
+                    if (!cam.IsRunning) break;
+                    System.Threading.Thread.Sleep(100);
+                }
+                if (cam.IsRunning) cam.Stop();
+                cam = null;
+            }
+        }
+
+        private void cam_NewFrame(object sender, NewFrameEventArgs eventArgs)
+        {
+            if (this.WindowState == FormWindowState.Minimized) return;
+            firstimage_captured = true;
+
+            cropSize = Math.Max(0, Math.Min(cropSize, Math.Min(eventArgs.Frame.Width / 2, eventArgs.Frame.Height / 2)));
+            float ratio = (float)eventArgs.Frame.Height / eventArgs.Frame.Width;
+            int vcropSize = (int)(cropSize * ratio);
+
+            var image = (Bitmap)eventArgs.Frame.Clone(new System.Drawing.Rectangle(cropSize, vcropSize,
+                eventArgs.Frame.Width - 2 * cropSize, eventArgs.Frame.Height - 2 * vcropSize), eventArgs.Frame.PixelFormat);
+
+            if (pictureBox1.SizeMode == PictureBoxSizeMode.StretchImage && stretchKeepAspectRatio == true)
+            {
+                float ratioImage = (float)eventArgs.Frame.Width / eventArgs.Frame.Height;
+                float ratioPictureBox = (float)pictureBox1.ClientSize.Width / pictureBox1.ClientSize.Height;
+                if (ratioImage >= ratioPictureBox)
+                {
+                    int newWidth = (int)(image.Height * ratioPictureBox);
+                    int wcrop = (int)((image.Width - newWidth) / 2);
+                    image = (Bitmap)image.Clone(new System.Drawing.Rectangle(wcrop, 0, image.Width - 2 * wcrop, image.Height), image.PixelFormat);
+                }
+                else
+                {
+                    int newHeight = (int)(image.Width / ratioPictureBox);
+                    int hcrop = (int)((image.Height - newHeight) / 2);
+                    image = (Bitmap)image.Clone(new System.Drawing.Rectangle(0, hcrop, image.Width, image.Height - 2 * hcrop), image.PixelFormat);
+                }
+            }
+            else if ((pictureBox1.SizeMode == PictureBoxSizeMode.CenterImage) && (cropSize != 0))
+            {
+                image = new Bitmap(image, new System.Drawing.Size(eventArgs.Frame.Width, eventArgs.Frame.Height));
+            }
+
+            if (state_flip_horizontal && state_flip_vertical)
+                image.RotateFlip(RotateFlipType.RotateNoneFlipXY);
+            else if (state_flip_horizontal)
+                image.RotateFlip(RotateFlipType.RotateNoneFlipX);
+            else if (state_flip_vertical)
+                image.RotateFlip(RotateFlipType.RotateNoneFlipY);
+
+            pictureBox1.Image = image;
+            GC.Collect();
+        }
+
+        // -------------------------------------------------------
+        //  FORM CLOSING  – save settings before exit
+        // -------------------------------------------------------
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            SaveSettings();
+            closeVideoCaptureDevice();
+        }
+
+        // -------------------------------------------------------
+        //  DELAY HELPER
+        // -------------------------------------------------------
         private static DateTime Delay(int MS)
         {
             DateTime ThisMoment = DateTime.Now;
             TimeSpan duration = new TimeSpan(0, 0, 0, 0, MS);
             DateTime AfterWards = ThisMoment.Add(duration);
-
             while (AfterWards >= ThisMoment)
             {
                 System.Windows.Forms.Application.DoEvents();
                 ThisMoment = DateTime.Now;
             }
-
             return DateTime.Now;
         }
 
+        // -------------------------------------------------------
+        //  MENU HANDLERS
+        // -------------------------------------------------------
         private void MenuItem_SetImageToClipboard_Click(object sender, EventArgs e)
-        {
-            Clipboard.SetImage(pictureBox1.Image);
-        }
+            => Clipboard.SetImage(pictureBox1.Image);
 
         private void MenuItem_SetImageToClipboardAfter5Sec_Click(object sender, EventArgs e)
         {
             if (label1.Visible == true) return;
-
             label1.Visible = true;
-            label1.Text = "5";
-            Delay(1000);
-            label1.Text = "4";
-            Delay(1000);
-            label1.Text = "3";
-            Delay(1000);
-            label1.Text = "2";
-            Delay(1000);
-            label1.Text = "1";
-            Delay(1000);
+            for (int s = 5; s >= 1; s--)
+            {
+                label1.Text = s.ToString();
+                Delay(1000);
+            }
             label1.Visible = false;
-
             Clipboard.SetImage(pictureBox1.Image);
         }
 
         private void MenuItem_CopyScreenToClipboard_Click(object sender, EventArgs e)
         {
-            // app.manifest에서 DPI aware를 사용한 경우 
-            Delay(300); // 메뉴가 사라지는 시간동안 약간 기다림. 
+            Delay(300);
             Image img = new Bitmap(pictureBox1.Width, pictureBox1.Height);
             Graphics g = Graphics.FromImage(img);
-            g.CopyFromScreen(PointToScreen(pictureBox1.Location), new System.Drawing.Point(0, 0), new System.Drawing.Size(pictureBox1.Width, pictureBox1.Height));
+            g.CopyFromScreen(PointToScreen(pictureBox1.Location), new System.Drawing.Point(0, 0),
+                new System.Drawing.Size(pictureBox1.Width, pictureBox1.Height));
             Clipboard.SetImage(img);
             g.Dispose();
         }
 
         private void MenuItem_GetImageFromClipboard_Click(object sender, EventArgs e)
         {
-            /*
-                if (Clipboard.ContainsImage())
-                {
-                    closeVideoCaptureDevice();
-                    pictureBox1.Image = Clipboard.GetImage();
-                }
-            */
-
-            // Transparent image 처리
-            //http://csharphelper.com/blog/2014/09/paste-a-png-format-image-with-a-transparent-background-from-the-clipboard-in-c/
-            //https://stackoverflow.com/questions/11273669/how-to-paste-a-transparent-image-from-the-clipboard-in-a-c-sharp-winforms-app
-            //https://www12.lunapic.com/editor/?action=transparent
             using (var bmp = GetImageFromClipboard())
             {
                 if (bmp != null)
@@ -381,8 +655,6 @@ namespace tCamView
                     }
                     pictureBox1.Refresh();
                     GC.Collect();
-
-                    //this.Text = "tCamview (clipboard)";
                 }
             }
         }
@@ -390,7 +662,7 @@ namespace tCamView
         private void MenuItem_About_Click(object sender, EventArgs e)
         {
             MessageBox.Show(
-                "tCamView 1.3.7\n" +
+                "tCamView 1.4.0\n" +
                 "Copyright © 2020-2021, Sung Deuk Kim\n" +
                 "All rights reserved.\n" +
                 "--------------------------------\n" +
@@ -398,16 +670,16 @@ namespace tCamView
                 "Published under the GNU GPLv3 license.\n" +
                 "(For details, see license.txt)\n" +
                 "--------------------------------\n" +
-                "Credits:\nAForge.NET http://www.aforgenet.com/"
-                );
+                "Credits:\nAForge.NET http://www.aforgenet.com/\n" +
+                "--------------------------------\n" +
+                "Added love from Claude AI and SOMEGUY"
+            );
         }
 
         private void MenuItem_VideoCaptureDevices_Click(object sender, EventArgs e)
         {
             int deviceID = (int)((object[])((MenuItem)sender).Tag)[0];
-            //MessageBox.Show("VideoCaptureDevice:" + index);
-
-            openVideoCaptureDevice(deviceID, -1); // -1: Choose the maximum resolution
+            openVideoCaptureDevice(deviceID, -1);
             currMenuItem0VideoCaptureDevices = deviceID;
             currMenuItem1VideoCapabilities = currSizeID;
             UpdateMenuItemsChecked();
@@ -416,123 +688,17 @@ namespace tCamView
         private void MenuItem_VideoCapabilties_Click(object sender, EventArgs e)
         {
             int sizeID = (int)((object[])((MenuItem)sender).Tag)[0];
-
             openVideoCaptureDevice(currCamID, sizeID);
             currMenuItem0VideoCaptureDevices = currCamID;
             currMenuItem1VideoCapabilities = sizeID;
             UpdateMenuItemsChecked();
         }
 
-        // [test] additioal feature: frame skipping to reduce CPU usage
-        //int frame_number_mod = -1;
-
-        private void cam_NewFrame(object sender, NewFrameEventArgs eventArgs)
-        {
-            //  Stretch.Alt모드에서 minimized되면 메모리가 계속증가되는 문제 해결
-            if (this.WindowState == FormWindowState.Minimized) return;  
-
-            firstimage_captured = true;
-
-            /*
-            frame_number_mod++;
-            frame_number_mod %= 2;  // 15Hz
-            //frame_number_mod %= 3;  // 10Hz
-            if (frame_number_mod != 0) return;
-            */
-
-            //lock (lockObject)
-            {
-
-                //https://stackoverflow.com/questions/9484935/how-to-cut-a-part-of-image-in-c-sharp
-                //var image = (Bitmap)eventArgs.Frame.Clone();
-
-                // 가로세로 비율을 유지하면서 영상 크기를 줄임.
-                cropSize = Math.Max(0,Math.Min(cropSize, Math.Min(eventArgs.Frame.Width / 2, eventArgs.Frame.Height / 2)));
-                float ratio = (float) eventArgs.Frame.Height / eventArgs.Frame.Width;
-                int vcropSize = (int)(cropSize * ratio);
-                var image = (Bitmap)eventArgs.Frame.Clone(new System.Drawing.Rectangle(cropSize, vcropSize, 
-                    eventArgs.Frame.Width - 2*cropSize, eventArgs.Frame.Height - 2*vcropSize), eventArgs.Frame.PixelFormat);
-
-                if (pictureBox1.SizeMode == PictureBoxSizeMode.StretchImage && stretchKeepAspectRatio == true)
-                {
-                    // 가로세로 비율을 유지하면서 Stretch수행  (UniformToFill, Stretch.Alt) 
-                    float ratioImage = (float)eventArgs.Frame.Width / eventArgs.Frame.Height;
-                    float ratioPictureBox = (float)pictureBox1.ClientSize.Width / pictureBox1.ClientSize.Height;
-                    if (ratioImage >= ratioPictureBox)
-                    {
-                        int newWidth = (int)(image.Height * ratioPictureBox);
-                        int wcrop = (int)((image.Width - newWidth) / 2);
-                        image = (Bitmap)image.Clone(new System.Drawing.Rectangle(wcrop, 0, image.Width - 2 * wcrop, image.Height), image.PixelFormat);
-                    }
-                    else
-                    {
-                        int newHeight = (int)(image.Width / ratioPictureBox);
-                        int hcrop = (int)((image.Height - newHeight) / 2);
-                        image = (Bitmap)image.Clone(new System.Drawing.Rectangle(0, hcrop, image.Width, image.Height - 2 * hcrop), image.PixelFormat);
-                    }
-                }
-                else if ((pictureBox1.SizeMode == PictureBoxSizeMode.CenterImage) && (cropSize != 0))
-                {
-                    // PictureBoxSizeMode.CenterImage인 경우 cropping이 발생하면 영상크기가 줄어듬.
-                    // 줄어든 영상을 원본영상크기로 재조정해서 보여주면 윈도우의 크기는 변화되지 않고 영상만 확대되는 느낌이 듦.
-                    image = new Bitmap(image, new System.Drawing.Size(eventArgs.Frame.Width, eventArgs.Frame.Height));
-                }
-
-                if (state_flip_horizontal == true && state_flip_vertical == true)
-                {
-                    image.RotateFlip(RotateFlipType.RotateNoneFlipXY);
-                }
-                else if (state_flip_horizontal == true)
-                {
-                    image.RotateFlip(RotateFlipType.RotateNoneFlipX);
-                }
-                else if (state_flip_vertical == true)
-                {
-                    image.RotateFlip(RotateFlipType.RotateNoneFlipY);
-                }
-
-                pictureBox1.Image = image;
-                GC.Collect();
-            }
-        }
-
-        private void closeVideoCaptureDevice()
-        {
-            if (cam != null)
-            {
-                cam.SignalToStop();
-
-                // wait ~ 3 seconds
-                for (int i = 0; i < 30; i++)
-                {
-                    if (!cam.IsRunning)
-                        break;
-                    System.Threading.Thread.Sleep(100);
-                }
-
-                if (cam.IsRunning)
-                {
-                    cam.Stop();
-                }
-
-                cam = null;
-            }
-        }
-
-        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            closeVideoCaptureDevice();
-        }
-
         private void MenuItem_Minimize_Click(object sender, EventArgs e)
-        {
-            this.WindowState = FormWindowState.Minimized;
-        }
+            => this.WindowState = FormWindowState.Minimized;
 
         private void MenuItem_Quit_Click(object sender, EventArgs e)
-        {
-            Application.Exit();
-        }
+            => Application.Exit();
 
         private void MenuItem_AlwaysOnTop_Click(object sender, EventArgs e)
         {
@@ -540,55 +706,22 @@ namespace tCamView
             UpdateMenuItemsChecked();
         }
 
-        private void MenuItem_Opacity_20_Click(object sender, EventArgs e)
-        {
-            this.Opacity = 0.2;
-        }
-
-        private void MenuItem_Opacity_40_Click(object sender, EventArgs e)
-        {
-            this.Opacity = 0.4;
-        }
-
-        private void MenuItem_Opacity_60_Click(object sender, EventArgs e)
-        {
-            this.Opacity = 0.6;
-        }
-
-        private void MenuItem_Opacity_80_Click(object sender, EventArgs e)
-        {
-            this.Opacity = 0.8;
-        }
-
-        private void MenuItem_Opacity_100_Click(object sender, EventArgs e)
-        {
-            this.Opacity = 1.0;
-        }
+        private void MenuItem_Opacity_20_Click(object sender, EventArgs e) => this.Opacity = 0.2;
+        private void MenuItem_Opacity_40_Click(object sender, EventArgs e) => this.Opacity = 0.4;
+        private void MenuItem_Opacity_60_Click(object sender, EventArgs e) => this.Opacity = 0.6;
+        private void MenuItem_Opacity_80_Click(object sender, EventArgs e) => this.Opacity = 0.8;
+        private void MenuItem_Opacity_100_Click(object sender, EventArgs e) => this.Opacity = 1.0;
 
         private void MenuItem_Opacity_Decrease_Click(object sender, EventArgs e)
         {
-            double opacityStep = 0.02;
-            if (this.Opacity <= (0.2 + opacityStep))
-            {
-                this.Opacity = 0.2;
-            }
-            else
-            {
-                this.Opacity -= opacityStep;
-            }
+            double step = 0.02;
+            this.Opacity = (this.Opacity <= 0.2 + step) ? 0.2 : this.Opacity - step;
         }
 
         private void MenuItem_Opacity_Increase_Click(object sender, EventArgs e)
         {
-            double opacityStep = 0.02;
-            if (this.Opacity >= (1.0 - opacityStep))
-            {
-                this.Opacity = 1.0;
-            }
-            else
-            {
-                this.Opacity += opacityStep;
-            }
+            double step = 0.02;
+            this.Opacity = (this.Opacity >= 1.0 - step) ? 1.0 : this.Opacity + step;
         }
 
         private void MenuItem_Vertical_Flipping_Click(object sender, EventArgs e)
@@ -605,46 +738,31 @@ namespace tCamView
 
         private void MenuItem_Normal_Border_Click(object sender, EventArgs e)
         {
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
-            WindowState = FormWindowState.Normal;
-            currMenuItem3WindowStyles = 0;
+            ApplyWindowStyle(0);
             UpdateMenuItemsChecked();
         }
 
         private void MenuItem_FullScreen_Click(object sender, EventArgs e)
         {
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
-            WindowState = FormWindowState.Normal;
-
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
-            WindowState = FormWindowState.Maximized;
-            //Bounds = Screen.PrimaryScreen.Bounds;
-            currMenuItem3WindowStyles = 4;
+            ApplyWindowStyle(4);
             UpdateMenuItemsChecked();
         }
 
         private void MenuItem_Borderless_Rectangle_Click(object sender, EventArgs e)
         {
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
-            Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 0, 0));
-            currMenuItem3WindowStyles = 2;
+            ApplyWindowStyle(2);
             UpdateMenuItemsChecked();
         }
 
         private void MenuItem_Borderless_RoundedRectangle_Click(object sender, EventArgs e)
         {
-            int m = Math.Min(Width, Height) / 4;
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
-            Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, m, m));
-            currMenuItem3WindowStyles = 3;
+            ApplyWindowStyle(3);
             UpdateMenuItemsChecked();
         }
 
         private void MenuItem_Borderless_Ellipse_Click(object sender, EventArgs e)
         {
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
-            Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, Width, Height));
-            currMenuItem3WindowStyles = 1;
+            ApplyWindowStyle(1);
             UpdateMenuItemsChecked();
         }
 
@@ -678,15 +796,8 @@ namespace tCamView
             UpdateMenuItemsChecked();
         }
 
-        private void MenuItem_CropImageZoomIn_Click(object sender, EventArgs e)
-        {
-            cropSize += 5;
-        }
-
-        private void MenuItem_CropImageZoomOut_Click(object sender, EventArgs e)
-        {
-            cropSize -= 5;
-        }
+        private void MenuItem_CropImageZoomIn_Click(object sender, EventArgs e) => cropSize += 5;
+        private void MenuItem_CropImageZoomOut_Click(object sender, EventArgs e) => cropSize -= 5;
 
         private void MenuItem_ResumeCameraPreviewFromClipboard_Click(object sender, EventArgs e)
         {
@@ -704,19 +815,7 @@ namespace tCamView
             if (Width > 4000 || Height > 2000) return;
             float ratio = (float)Height / Width;
             Size = new Size(Width + 5, (int)(Height + 5 * ratio + 0.5));
-            if (currMenuItem3WindowStyles == 1) // Borderless_Ellipse
-            {
-                Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, Width, Height));
-            }
-            else if (currMenuItem3WindowStyles == 2) // Borderless_Rectangle
-            {
-                Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 0, 0));
-            }
-            else if (currMenuItem3WindowStyles == 3) // Borderless_RoundedRectangle
-            {
-                int m = Math.Min(Width, Height) / 4;
-                Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, m, m));
-            }
+            RefreshRegion();
         }
 
         private void MenuItem_DecreaseWindowSize_Click(object sender, EventArgs e)
@@ -724,195 +823,81 @@ namespace tCamView
             if (Width < 50 || Height < 50) return;
             float ratio = (float)Height / Width;
             Size = new Size(Width - 5, (int)(Height - 5 * ratio + 0.5));
-            if (currMenuItem3WindowStyles == 1) // Borderless_Ellipse
-            {
+            RefreshRegion();
+        }
+
+        private void RefreshRegion()
+        {
+            if (currMenuItem3WindowStyles == 1)
                 Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, Width, Height));
-            }
-            else if (currMenuItem3WindowStyles == 2) // Borderless_Rectangle
-            {
+            else if (currMenuItem3WindowStyles == 2)
                 Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 0, 0));
-            }
-            else if (currMenuItem3WindowStyles == 3) // Borderless_RoundedRectangle
+            else if (currMenuItem3WindowStyles == 3)
             {
                 int m = Math.Min(Width, Height) / 4;
                 Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, m, m));
             }
         }
 
+        // -------------------------------------------------------
+        //  KEYBOARD
+        // -------------------------------------------------------
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            //////////////////////////////////////////////
-            /// Opacity
             double opacityStep = 0.02;
             if (keyData == Keys.Up)
             {
-                if (this.Opacity >= (1.0 - opacityStep))
-                {
-                    this.Opacity = 1.0;
-                }
-                else
-                {
-                    this.Opacity += opacityStep;
-                }
+                this.Opacity = (this.Opacity >= 1.0 - opacityStep) ? 1.0 : this.Opacity + opacityStep;
                 return true;
             }
             else if (keyData == Keys.Down)
             {
-                if (this.Opacity <= (0.2 + opacityStep))
-                {
-                    this.Opacity = 0.2;
-                }
-                else
-                {
-                    this.Opacity -= opacityStep;
-                }
+                this.Opacity = (this.Opacity <= 0.2 + opacityStep) ? 0.2 : this.Opacity - opacityStep;
                 return true;
             }
-            else if (keyData == Keys.Right)
-            {
-                this.Opacity = 1.0;
-                return true;
-            }
-            else if (keyData == Keys.Left)
-            {
-                this.Opacity = 0.2;
-                return true;
-            }
-
+            else if (keyData == Keys.Right) { this.Opacity = 1.0; return true; }
+            else if (keyData == Keys.Left)  { this.Opacity = 0.2; return true; }
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
         private void Form1_KeyDown(object sender, KeyEventArgs e)
         {
-            if (e.KeyData == (Keys.Control | Keys.C))
-            {
-                MenuItem_SetImageToClipboard_Click(null, null);
-                //e.SuppressKeyPress = true;
-                return;
-            }
-            else if (e.KeyData == (Keys.Control | Keys.V))
-            {
-                MenuItem_GetImageFromClipboard_Click(null, null);
-                //e.SuppressKeyPress = true;
-                return;
-            }
-
+            if (e.KeyData == (Keys.Control | Keys.C)) { MenuItem_SetImageToClipboard_Click(null, null); return; }
+            if (e.KeyData == (Keys.Control | Keys.V)) { MenuItem_GetImageFromClipboard_Click(null, null); return; }
 
             switch (e.KeyData)
             {
-                //////////////////////////////////////////////
-                /// Picture Mode
-                case Keys.Z:
-                    MenuItem_Zoom_Click(null, null);
-                    return;
-                case Keys.X:
-                    MenuItem_Stretch_Click(null, null);
-                    return;
-                case Keys.C:
-                    MenuItem_Center_Click(null, null);
-                    return;
-                case Keys.A:
-                    MenuItem_AltStretch_Click(null, null);
-                    return;
-
-                //////////////////////////////////////////////
-                /// Borderless Mode
-                case Keys.N: // Normal Border (Resizable)
-                case Keys.Escape:
-                    MenuItem_Normal_Border_Click(null, null);
-                    return;
-                case Keys.E: // Borderless Ellipse (FixedSize)
-                    MenuItem_Borderless_Ellipse_Click(null, null);
-                    return;
-                case Keys.R: // Borderless Rectangle (FixedSize)
-                    MenuItem_Borderless_Rectangle_Click(null, null);
-                    return;
-                case Keys.W: // Borderless Rounded Rectangle (FixedSize)
-                    MenuItem_Borderless_RoundedRectangle_Click(null, null);
-                    return;
-                case Keys.F: // Full Screen
-                    MenuItem_FullScreen_Click(null, null);
-                    return;
-
-                //////////////////////////////////////////////
-                /// Image Flipping
-                case Keys.H: // Horizontal Flipping (toggle)
-                    MenuItem_Horizontal_Flipping_Click(null, null);
-                    return;
-                case Keys.V: // Vertical Flipping (toggle)
-                    MenuItem_Vertical_Flipping_Click(null, null);
-                    return;
-
-                //////////////////////////////////////////////
-                /// Window Control
-                case Keys.T: // Always on Top (toggle)
-                    MenuItem_AlwaysOnTop_Click(null, null);
-                    return;
-                case Keys.Q: // Quit
-                    Application.Exit();
-                    return;
-
-                case Keys.L: // Minimize
-                    this.WindowState = FormWindowState.Minimized;
-                    return;
-                /*
-                    case Keys.U: // Maximize
-                        if (WindowState == FormWindowState.Normal)
-                        {
-                            this.WindowState = FormWindowState.Maximized;
-                        }
-                        else
-                        {
-                            this.WindowState = FormWindowState.Normal;
-                        }
-                        return;
-                */
-
-                case Keys.Space: // Resume CameraPreview (escaping from the clipboard view state)
-                    MenuItem_ResumeCameraPreviewFromClipboard_Click(null, null);
-                    return;
-
-                case Keys.P: // Increase the window size
-                    MenuItem_IncreaseWindowSize_Click(null, null);
-                    return;
-
-                case Keys.M: // Descrease the window size
-                    MenuItem_DecreaseWindowSize_Click(null, null);
-                    return;
-
-                //////////////////////////////////////////////
-                /// Additional Features
-                case Keys.G: // GetImageFromClipboard
-                    MenuItem_GetImageFromClipboard_Click(null, null);
-                    return;
-
-                case Keys.I: // SetImageToClipboard
-                    MenuItem_SetImageToClipboard_Click(null, null);
-                    return;
-
-                case Keys.D: // SetImageToClipboardAfter5Sec
-                    MenuItem_SetImageToClipboardAfter5Sec_Click(null, null);
-                    return;
-
-                case Keys.S: // CopyScreenToClipboard
-                    MenuItem_CopyScreenToClipboard_Click(null, null);
-                    return;
-
-                //////////////////////////////////////////////
-                /// Digital Zoom Effect
-                case Keys.PageUp:
-                    MenuItem_CropImageZoomIn_Click(null, null);
-                    return;
-
-                case Keys.PageDown:
-                    MenuItem_CropImageZoomOut_Click(null, null);
-                    return;
-
+                case Keys.Z:  MenuItem_Zoom_Click(null, null); return;
+                case Keys.X:  MenuItem_Stretch_Click(null, null); return;
+                case Keys.C:  MenuItem_Center_Click(null, null); return;
+                case Keys.A:  MenuItem_AltStretch_Click(null, null); return;
+                case Keys.N:
+                case Keys.Escape: MenuItem_Normal_Border_Click(null, null); return;
+                case Keys.E:  MenuItem_Borderless_Ellipse_Click(null, null); return;
+                case Keys.R:  MenuItem_Borderless_Rectangle_Click(null, null); return;
+                case Keys.W:  MenuItem_Borderless_RoundedRectangle_Click(null, null); return;
+                case Keys.F:  MenuItem_FullScreen_Click(null, null); return;
+                case Keys.H:  MenuItem_Horizontal_Flipping_Click(null, null); return;
+                case Keys.V:  MenuItem_Vertical_Flipping_Click(null, null); return;
+                case Keys.T:  MenuItem_AlwaysOnTop_Click(null, null); return;
+                case Keys.K:  ToggleLockAspectRatio(); return;  // NEW
+                case Keys.Q:  Application.Exit(); return;
+                case Keys.L:  this.WindowState = FormWindowState.Minimized; return;
+                case Keys.Space: MenuItem_ResumeCameraPreviewFromClipboard_Click(null, null); return;
+                case Keys.P: MenuItem_IncreaseWindowSize_Click(null, null); return;
+                case Keys.M: MenuItem_DecreaseWindowSize_Click(null, null); return;
+                case Keys.G: MenuItem_GetImageFromClipboard_Click(null, null); return;
+                case Keys.I: MenuItem_SetImageToClipboard_Click(null, null); return;
+                case Keys.D: MenuItem_SetImageToClipboardAfter5Sec_Click(null, null); return;
+                case Keys.S: MenuItem_CopyScreenToClipboard_Click(null, null); return;
+                case Keys.PageUp:   MenuItem_CropImageZoomIn_Click(null, null); return;
+                case Keys.PageDown: MenuItem_CropImageZoomOut_Click(null, null); return;
             }
         }
 
-        // Form 내부 영역을 왼쪽 마우스 클릭해서 옮길 수 있도록 함.
-        // https://www.codeproject.com/Articles/11114/Move-window-form-without-Titlebar-in-C
+        // -------------------------------------------------------
+        //  MOUSE DRAG (move borderless window)
+        // -------------------------------------------------------
         public const int WM_NCLBUTTONDOWN = 0xA1;
         public const int HT_CAPTION = 0x2;
 
@@ -930,33 +915,27 @@ namespace tCamView
             }
         }
 
-        //https://stackoverflow.com/questions/11273669/how-to-paste-a-transparent-image-from-the-clipboard-in-a-c-sharp-winforms-app
-        // Sample usage:
-        // protected override void OnPaint(PaintEventArgs e)
-        // {
-        //    using (var bmp = GetImageFromClipboard())
-        //    {
-        //        if (bmp != null) e.Graphics.DrawImage(bmp, 0, 0);
-        //    }
-        // }
+        // -------------------------------------------------------
+        //  CLIPBOARD HELPER
+        // -------------------------------------------------------
         private Image GetImageFromClipboard()
         {
             if (Clipboard.GetDataObject() == null) return null;
             if (Clipboard.GetDataObject().GetDataPresent(DataFormats.Dib))
             {
                 var dib = ((System.IO.MemoryStream)Clipboard.GetData(DataFormats.Dib)).ToArray();
-                var width = BitConverter.ToInt32(dib, 4);
+                var width  = BitConverter.ToInt32(dib, 4);
                 var height = BitConverter.ToInt32(dib, 8);
-                var bpp = BitConverter.ToInt16(dib, 14);
+                var bpp    = BitConverter.ToInt16(dib, 14);
                 if (bpp == 32)
                 {
                     var gch = GCHandle.Alloc(dib, GCHandleType.Pinned);
                     Bitmap bmp = null;
                     try
                     {
-                        var ptr = new IntPtr((long)gch.AddrOfPinnedObject() + 52);  // 40 ? 52 ? => 52가 맞았음.
+                        var ptr = new IntPtr((long)gch.AddrOfPinnedObject() + 52);
                         bmp = new Bitmap(width, height, width * 4, System.Drawing.Imaging.PixelFormat.Format32bppArgb, ptr);
-                        bmp.RotateFlip(RotateFlipType.RotateNoneFlipY); // flipping이 필요했음.
+                        bmp.RotateFlip(RotateFlipType.RotateNoneFlipY);
                         return new Bitmap(bmp);
                     }
                     finally
@@ -968,6 +947,5 @@ namespace tCamView
             }
             return Clipboard.ContainsImage() ? Clipboard.GetImage() : null;
         }
-
     }
 }
