@@ -63,10 +63,11 @@ namespace tCamView
         bool lockAspectRatio = false;
         double lockedAspect = 0.0; // height / width
 
-        // --- Settings file path ---
+        // --- Settings file path & version ---
         private static readonly string SettingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "tCamView", "settings.ini");
+        private const int SettingsVersion = 2;
 
         public Form1()
         {
@@ -90,6 +91,7 @@ namespace tCamView
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
                 var sb = new StringBuilder();
+                sb.AppendLine("SettingsVersion=" + SettingsVersion);
                 sb.AppendLine("CamID=" + currCamID);
                 sb.AppendLine("SizeID=" + currSizeID);
                 sb.AppendLine("PictureSizeMode=" + (int)pictureBox1.SizeMode);
@@ -125,6 +127,15 @@ namespace tCamView
                     var idx = line.IndexOf('=');
                     if (idx > 0)
                         dict[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
+                }
+                // If the settings file is from an older version, ignore it entirely
+                // and let the app start fresh with defaults
+                int savedVersion = 0;
+                if (!dict.ContainsKey("SettingsVersion") ||
+                    !int.TryParse(dict["SettingsVersion"], out savedVersion) ||
+                    savedVersion < SettingsVersion)
+                {
+                    return new Dictionary<string, string>();
                 }
             }
             catch { }
@@ -556,22 +567,27 @@ namespace tCamView
             {
                 float ratioImage = (float)eventArgs.Frame.Width / eventArgs.Frame.Height;
                 float ratioPictureBox = (float)pictureBox1.ClientSize.Width / pictureBox1.ClientSize.Height;
+                Bitmap cropped;
                 if (ratioImage >= ratioPictureBox)
                 {
                     int newWidth = (int)(image.Height * ratioPictureBox);
                     int wcrop = (int)((image.Width - newWidth) / 2);
-                    image = (Bitmap)image.Clone(new System.Drawing.Rectangle(wcrop, 0, image.Width - 2 * wcrop, image.Height), image.PixelFormat);
+                    cropped = (Bitmap)image.Clone(new System.Drawing.Rectangle(wcrop, 0, image.Width - 2 * wcrop, image.Height), image.PixelFormat);
                 }
                 else
                 {
                     int newHeight = (int)(image.Width / ratioPictureBox);
                     int hcrop = (int)((image.Height - newHeight) / 2);
-                    image = (Bitmap)image.Clone(new System.Drawing.Rectangle(0, hcrop, image.Width, image.Height - 2 * hcrop), image.PixelFormat);
+                    cropped = (Bitmap)image.Clone(new System.Drawing.Rectangle(0, hcrop, image.Width, image.Height - 2 * hcrop), image.PixelFormat);
                 }
+                image.Dispose(); // dispose the intermediate clone
+                image = cropped;
             }
             else if ((pictureBox1.SizeMode == PictureBoxSizeMode.CenterImage) && (cropSize != 0))
             {
-                image = new Bitmap(image, new System.Drawing.Size(eventArgs.Frame.Width, eventArgs.Frame.Height));
+                var resized = new Bitmap(image, new System.Drawing.Size(eventArgs.Frame.Width, eventArgs.Frame.Height));
+                image.Dispose();
+                image = resized;
             }
 
             if (state_flip_horizontal && state_flip_vertical)
@@ -581,8 +597,11 @@ namespace tCamView
             else if (state_flip_vertical)
                 image.RotateFlip(RotateFlipType.RotateNoneFlipY);
 
+            // Dispose the previous frame before replacing it — this is the main memory leak fix.
+            // Bitmap holds unmanaged GDI memory that the GC won't release promptly on its own.
+            var oldImage = pictureBox1.Image;
             pictureBox1.Image = image;
-            GC.Collect();
+            oldImage?.Dispose();
         }
 
         // -------------------------------------------------------
@@ -654,7 +673,6 @@ namespace tCamView
                         gr.Dispose();
                     }
                     pictureBox1.Refresh();
-                    GC.Collect();
                 }
             }
         }
