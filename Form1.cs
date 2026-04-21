@@ -82,6 +82,14 @@ namespace tCamView
             this.Text = "tCamView (alt.stretch)";
         }
 
+        // Changing FormBorderStyle causes Windows to recreate the window handle (HWND),
+        // which drops the taskbar entry. Re-assert ShowInTaskbar every time this happens.
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            this.ShowInTaskbar = true;
+        }
+
         // -------------------------------------------------------
         //  SETTINGS  SAVE / LOAD
         // -------------------------------------------------------
