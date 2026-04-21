@@ -701,7 +701,7 @@ namespace tCamView
         private void MenuItem_About_Click(object sender, EventArgs e)
         {
             MessageBox.Show(
-                "tCamView 1.4.0\n" +
+                "tCamView 1.4.1\n" +
                 "Copyright © 2020-2021, Sung Deuk Kim\n" +
                 "All rights reserved.\n" +
                 "--------------------------------\n" +
