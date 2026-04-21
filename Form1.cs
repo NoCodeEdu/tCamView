@@ -77,9 +77,11 @@ namespace tCamView
             this.Icon = Properties.Resources.webcam;
             this.Opacity = 1.0;
             this.ShowInTaskbar = true;
+            this.TopMost = false; // keep false until Form1_Shown fires
             pictureBox1.SizeMode = PictureBoxSizeMode.StretchImage;
             stretchKeepAspectRatio = true;
             this.Text = "tCamView (alt.stretch)";
+            this.Shown += new EventHandler(Form1_Shown);
         }
 
         // Changing FormBorderStyle causes Windows to recreate the window handle (HWND),
@@ -233,8 +235,9 @@ namespace tCamView
             // Restore opacity
             this.Opacity = GetSetting(settings, "Opacity", 1.0);
 
-            // Restore always on top
-            this.TopMost = GetSetting(settings, "AlwaysOnTop", true);
+            // Defer TopMost until Form1_Shown — setting it during Load causes Windows
+            // to drop the taskbar entry before the window is fully registered
+            _pendingTopMost = GetSetting(settings, "AlwaysOnTop", true);
 
             // Restore lock aspect ratio
             lockAspectRatio = GetSetting(settings, "LockAspectRatio", false);
@@ -266,6 +269,16 @@ namespace tCamView
                 lockedAspect = (double)this.Height / this.Width;
 
             UpdateMenuItemsChecked();
+        }
+
+        // TopMost is applied here rather than in Form1_Load so the window is fully
+        // registered with the taskbar first — setting it earlier causes Windows to
+        // silently remove the taskbar button.
+        private bool _pendingTopMost = true;
+        private void Form1_Shown(object sender, EventArgs e)
+        {
+            this.TopMost = false;
+            this.TopMost = _pendingTopMost;
         }
 
         private void ApplyWindowStyle(int styleIndex)
