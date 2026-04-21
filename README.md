@@ -1,3 +1,7 @@
+*THIS FORK was created to have the last used settings save on exit. Idea was to enable the program to start with Windows and not need to configure the settings each time. 
+
+I am not a developer, no background in applications, all updated code was generated with AI. 
+
 ## tCamView
 
 tCamView is a simple WebCam viewer software.
