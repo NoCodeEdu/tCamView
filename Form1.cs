@@ -709,9 +709,12 @@ namespace tCamView
                 "Published under the GNU GPLv3 license.\n" +
                 "(For details, see license.txt)\n" +
                 "--------------------------------\n" +
-                "Credits:\nAForge.NET http://www.aforgenet.com/\n" +
+                "Credits:\nAForge.NET https://github.com/andrewkirillov/AForge.NET\n" +
                 "--------------------------------\n" +
-                "Added love from Claude AI and SOMEGUY"
+                "Added love from Claude AI and SOMEGUY."+
+                "--------------------------------\n" +
+                "https://github.com/NoCodeEdu/tCamView-fork/"
+
             );
         }
 
